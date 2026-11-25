@@ -50,9 +50,21 @@ public class LanChat {
         switch (args[0]) {
             case "listen" -> {
                 int port = args.length > 1 ? Integer.parseInt(args[1]) : DEFAULT_PORT;
+                ServerSocket server;
+                try {
+                    server = new ServerSocket(port);
+                } catch (BindException e) {
+                    error("Port " + port + " is already in use on this computer.");
+                    error("(On macOS the AirPlay Receiver uses port 5000.) Try another port, e.g.:");
+                    error("  java LanChat.java listen 5050     and your friend: connect <ip> 5050");
+                    return;
+                }
                 Thread discovery = startDiscoveryResponder(name, port);
-                try (ServerSocket server = new ServerSocket(port)) {
+                try (server) {
                     info("Listening on " + localIps() + " port " + port + " ... waiting for a peer");
+                    info("Your friend runs: java LanChat.java connect <one of the IPs above>"
+                            + (port == DEFAULT_PORT ? "" : " " + port));
+                    info("Make sure your firewall allows incoming TCP " + port + " (see README 'Troubleshooting').");
                     Socket s = server.accept();
                     discovery.interrupt();
                     new LanChat(s, name).run();
@@ -63,7 +75,22 @@ public class LanChat {
                 int port = args.length > 2 ? Integer.parseInt(args[2]) : DEFAULT_PORT;
                 info("Connecting to " + args[1] + ":" + port + " ...");
                 Socket s = new Socket();
-                s.connect(new InetSocketAddress(args[1], port), 5000);
+                try {
+                    s.connect(new InetSocketAddress(args[1], port), 5000);
+                } catch (SocketTimeoutException | NoRouteToHostException e) {
+                    error("No answer from " + args[1] + ":" + port + ".");
+                    error("Usually this means the other computer's FIREWALL is blocking TCP " + port
+                            + ", or you are not on the same network (check both IPs start the same, e.g. 192.168.1.x).");
+                    return;
+                } catch (ConnectException e) {
+                    error("Connection refused by " + args[1] + ":" + port + ".");
+                    error("Nothing is listening there: ask your friend to run 'java LanChat.java listen"
+                            + (port == DEFAULT_PORT ? "" : " " + port) + "' first, and check the IP and port.");
+                    return;
+                } catch (UnknownHostException e) {
+                    error("Unknown host: " + args[1]);
+                    return;
+                }
                 new LanChat(s, name).run();
             }
             case "scan" -> scan();
@@ -227,27 +254,66 @@ public class LanChat {
         info("Scanning LAN for listening peers (3 seconds) ...");
         try (DatagramSocket ds = new DatagramSocket()) {
             ds.setBroadcast(true);
-            ds.setSoTimeout(3000);
             byte[] msg = DISCOVER_MSG.getBytes(StandardCharsets.UTF_8);
             for (InetAddress bcast : broadcastAddresses()) {
-                ds.send(new DatagramPacket(msg, msg.length, bcast, DISCOVERY_PORT));
+                try { ds.send(new DatagramPacket(msg, msg.length, bcast, DISCOVERY_PORT)); } catch (IOException ignored) { }
+            }
+            // Also ask every address on the local subnet directly. Replies to a broadcast are
+            // dropped by stateful firewalls (ufw, Windows Defender) because they don't match the
+            // outgoing packet; replies to a unicast probe do, so this works without opening ports
+            // on the scanning machine.
+            for (InetAddress host : subnetHosts()) {
+                try { ds.send(new DatagramPacket(msg, msg.length, host, DISCOVERY_PORT)); } catch (IOException ignored) { }
             }
             byte[] buf = new byte[256];
-            int found = 0;
+            java.util.Set<String> seen = new java.util.HashSet<>();
+            java.util.Set<String> mine = new java.util.HashSet<>(java.util.Arrays.asList(localIps().split(", ")));
             long end = System.currentTimeMillis() + 3000;
-            while (System.currentTimeMillis() < end) {
+            while (true) {
+                long left = end - System.currentTimeMillis();
+                if (left <= 0) break;
+                ds.setSoTimeout((int) left);
                 DatagramPacket p = new DatagramPacket(buf, buf.length);
                 try { ds.receive(p); } catch (SocketTimeoutException e) { break; }
                 String reply = new String(p.getData(), 0, p.getLength(), StandardCharsets.UTF_8);
-                if (reply.startsWith(REPLY_PREFIX)) {
-                    String[] parts = reply.substring(REPLY_PREFIX.length()).split(":");
-                    String ip = p.getAddress().getHostAddress();
-                    System.out.println(GREEN + "  " + parts[0] + "  ->  java LanChat.java connect " + ip + " " + parts[1] + RESET);
-                    found++;
+                if (!reply.startsWith(REPLY_PREFIX)) continue;
+                String body = reply.substring(REPLY_PREFIX.length());
+                int colon = body.lastIndexOf(':');
+                if (colon < 0) continue;
+                String peer = body.substring(0, colon), port = body.substring(colon + 1);
+                String ip = p.getAddress().getHostAddress();
+                if (!seen.add(ip + ":" + port)) continue;
+                String note = mine.contains(ip) || p.getAddress().isLoopbackAddress() ? "  (this computer)" : "";
+                System.out.println(GREEN + "  " + peer + "  ->  java LanChat.java connect " + ip + " " + port + note + RESET);
+            }
+            if (seen.isEmpty()) {
+                info("No peers found. Ask your friend to run: java LanChat.java listen");
+                info("If they are listening, their firewall is probably blocking UDP " + DISCOVERY_PORT
+                        + " / TCP " + DEFAULT_PORT + " (see README 'Troubleshooting').");
+            }
+        }
+    }
+
+    /** All IPv4 host addresses on directly attached subnets of /22 or smaller (max ~1000 hosts each). */
+    static java.util.List<InetAddress> subnetHosts() throws IOException {
+        java.util.List<InetAddress> hosts = new java.util.ArrayList<>();
+        for (NetworkInterface ni : java.util.Collections.list(NetworkInterface.getNetworkInterfaces())) {
+            if (!ni.isUp() || ni.isLoopback() || ni.isPointToPoint()) continue;
+            for (InterfaceAddress ia : ni.getInterfaceAddresses()) {
+                if (!(ia.getAddress() instanceof Inet4Address) || ia.getBroadcast() == null) continue;
+                int prefix = ia.getNetworkPrefixLength();
+                if (prefix < 22 || prefix > 30) continue;
+                byte[] a = ia.getAddress().getAddress();
+                int ip = ((a[0] & 0xff) << 24) | ((a[1] & 0xff) << 16) | ((a[2] & 0xff) << 8) | (a[3] & 0xff);
+                int mask = -1 << (32 - prefix);
+                int net = ip & mask, bcast = net | ~mask;
+                for (int h = net + 1; h < bcast; h++) {
+                    hosts.add(InetAddress.getByAddress(new byte[] {
+                            (byte) (h >>> 24), (byte) (h >>> 16), (byte) (h >>> 8), (byte) h }));
                 }
             }
-            if (found == 0) info("No peers found. Ask your friend to run: java LanChat.java listen");
         }
+        return hosts;
     }
 
     static java.util.List<InetAddress> broadcastAddresses() throws IOException {
